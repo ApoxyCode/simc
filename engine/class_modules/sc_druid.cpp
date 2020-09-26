@@ -228,8 +228,13 @@ struct eclipse_handler_t
   unsigned wrath_counter;
   unsigned starfire_counter;
   eclipse_state_e state;
+  bool enabled_;
 
-  eclipse_handler_t( druid_t* player ) : p( player ), wrath_counter( 2 ), starfire_counter( 2 ), state( ANY_NEXT ) {}
+  eclipse_handler_t( druid_t* player )
+    : p( player ), wrath_counter( 2 ), starfire_counter( 2 ), state( ANY_NEXT ), enabled_( false )
+  {}
+
+  bool enabled() { return enabled_; }
 
   void cast_wrath();
   void cast_starfire();
@@ -312,6 +317,7 @@ public:
     action_t* frenzied_assault;
     action_t* lycaras_fleeting_glimpse;  // fake holder action for reporting
     action_t* oneths_clear_vision;       // fake holder action for reporting
+    action_t* the_natural_orders_will;   // fake holder action for reporting
   } active;
 
   // Pets
@@ -383,6 +389,7 @@ public:
     buff_t* heart_of_the_wild;
     // General Legendaries
     buff_t* oath_of_the_elder_druid;
+    buff_t* lycaras_fleeting_glimpse;  // lycara's '5s warning' buff
     // Conduits
     buff_t* ursine_vigor;
 
@@ -1026,6 +1033,8 @@ druid_t::~druid_t()
 // eclipse handler function definitions
 void eclipse_handler_t::cast_wrath()
 {
+  if ( !enabled() ) return;
+
   if ( state == ANY_NEXT || state == LUNAR_NEXT )
   {
     wrath_counter--;
@@ -1035,11 +1044,24 @@ void eclipse_handler_t::cast_wrath()
 
 void eclipse_handler_t::cast_starfire()
 {
+  if ( !enabled() ) return;
+
   if ( state == ANY_NEXT || state == SOLAR_NEXT )
   {
     starfire_counter--;
     advance_eclipse();
   }
+}
+
+void eclipse_handler_t::cast_starsurge()
+{
+  if ( !enabled() ) return;
+
+  if ( state == IN_SOLAR || state == IN_LUNAR || state == IN_BOTH )
+  p->buff.starsurge->trigger();
+
+  if ( p->conduit.stellar_inspiration->ok() && p->rng().roll( p->conduit.stellar_inspiration.percent() ) )
+    p->buff.starsurge->trigger();
 }
 
 void eclipse_handler_t::advance_eclipse()
@@ -1091,15 +1113,6 @@ void eclipse_handler_t::advance_eclipse()
 
   if ( state == IN_BOTH )
     state = ANY_NEXT;
-}
-
-void eclipse_handler_t::cast_starsurge()
-{
-  if ( state == IN_SOLAR || state == IN_LUNAR || state == IN_BOTH )
-  p->buff.starsurge->trigger();
-
-  if ( p->conduit.stellar_inspiration->ok() && p->rng().roll( p->conduit.stellar_inspiration.percent() ) )
-    p->buff.starsurge->trigger();
 }
 
 void eclipse_handler_t::trigger_both( timespan_t d = 0_ms )
@@ -3518,6 +3531,7 @@ public:
       {
         p()->resource_gain( RESOURCE_COMBO_POINT, p()->buff.eye_of_fearful_symmetry->check_value(),
                             p()->gain.eye_of_fearful_symmetry );
+        p()->buff.eye_of_fearful_symmetry->expire();
       }
 
       if ( p()->conduit.sudden_ambush->ok() && rng().roll( p()->conduit.sudden_ambush.percent() * consumed ) )
@@ -3903,6 +3917,7 @@ struct feral_frenzy_driver_t : public cat_attack_t
 
   double tick_ap_ratio;
 
+  // use hardcoded spell id so feral frenzy can be used as a secondary action
   feral_frenzy_driver_t( druid_t* p, const std::string& options_str )
     : cat_attack_t( "feral_frenzy", p, p->find_spell( 274837 ) )
   {
@@ -4928,8 +4943,9 @@ struct pulverize_t : public bear_attack_t
 {
   int consume;
 
-  pulverize_t( druid_t* player, const std::string& options_str )
-    : bear_attack_t( "pulverize", player, player->talent.pulverize, options_str )
+  // use hardcoded spell id so pulverize can be used as a secondary action
+  pulverize_t( druid_t* p, const std::string& options_str )
+    : bear_attack_t( "pulverize", p, p->find_spell( 80313 ), options_str )
   {
     consume = as<int>( data().effectN( 3 ).base_value() );
   }
@@ -4946,6 +4962,14 @@ struct pulverize_t : public bear_attack_t
       // and reduce damage taken by x% for y sec.
       p()->buff.pulverize->trigger();
     }
+  }
+
+  bool ready() override
+  {
+    if ( !p()->talent.pulverize->ok() )
+      return false;
+
+    return bear_attack_t::ready();
   }
 
   bool target_ready( player_t* t ) override
@@ -7203,6 +7227,9 @@ struct convoke_the_spirits_t : public druid_spell_t
 
     druid_spell_t::tick( d );
 
+    if ( d->time_to_tick < base_tick_time )
+      return;
+
     if ( d->current_tick == ultimate_tick )
     {
       if ( p()->buff.moonkin_form->check() )
@@ -7394,7 +7421,7 @@ struct adaptive_swarm_t : public druid_spell_t
 
     player_t* new_swarm_target()
     {
-      auto tl = other->target_list();
+      const auto &tl = other->target_list();
       if ( !tl.size() )
         return nullptr;
 
@@ -7709,22 +7736,29 @@ struct lycaras_fleeting_glimpse_t : public action_t
       a->set_target( d->target );
       a->execute();
     }
+
+    make_event( *sim, timespan_t::from_seconds( d->buff.lycaras_fleeting_glimpse->default_value ), [ this ]() {
+      d->buff.lycaras_fleeting_glimpse->trigger();
+    } );
   }
 };
 
-struct lycaras_fleeting_glimpse_event_t : public event_t
+struct the_natural_orders_will_t : public action_t
 {
-  druid_t* d;
-  timespan_t interval;
+  action_t* ironfur;
+  action_t* frenzied;
 
-  lycaras_fleeting_glimpse_event_t( druid_t* p, timespan_t tm ) : event_t( *p, tm ), d( p ), interval( tm ) {}
-
-  const char* name() const override { return "lycaras_fleeting_glimpse"; }
+  the_natural_orders_will_t( druid_t* p )
+    : action_t( action_e::ACTION_OTHER, "the_natural_orders_will", p, p->legendary.the_natural_orders_will )
+  {
+    ironfur  = p->get_secondary_action<spells::ironfur_t>( "Ironfur", "" );
+    frenzied = p->get_secondary_action<heals::frenzied_regeneration_t>( "Frenzied Regeneration", "" );
+  }
 
   void execute() override
   {
-    d->active.lycaras_fleeting_glimpse->execute();
-    make_event<lycaras_fleeting_glimpse_event_t>( sim(), d, interval );
+    ironfur->execute();
+    frenzied->execute();
   }
 };
 
@@ -8338,6 +8372,16 @@ void druid_t::create_buffs()
   buff.oath_of_the_elder_druid = make_buff( this, "oath_of_the_elder_druid", find_spell( 338643 ) )
     ->set_quiet( true );
 
+  buff.lycaras_fleeting_glimpse = make_buff( this, "lycaras_fleeting_glimpse", find_spell( 340060 ) )
+    ->set_period( 0_ms )
+    ->set_stack_change_callback( [ this ]( buff_t*, int, int new_ ) {
+      if ( !new_ )
+        active.lycaras_fleeting_glimpse->execute();
+    } );
+  // default value used as interval for event
+  buff.lycaras_fleeting_glimpse->set_default_value( legendary.lycaras_fleeting_glimpse->effectN( 1 ).base_value() -
+                                                    buff.lycaras_fleeting_glimpse->buff_duration().total_seconds() );
+
   // Endurance conduits
   buff.ursine_vigor = make_buff<ursine_vigor_buff_t>( *this );
 
@@ -8464,12 +8508,18 @@ void druid_t::create_buffs()
   buff.barkskin = make_buff( this, "barkskin", spec.barkskin )
     ->set_cooldown( 0_ms )
     ->set_default_value_from_effect_type( A_MOD_DAMAGE_PERCENT_TAKEN )
-    ->set_tick_behavior( talent.brambles->ok() ? buff_tick_behavior::REFRESH : buff_tick_behavior::NONE )
-    ->apply_affecting_aura( find_rank_spell( "Barkskin", "Rank 2") )
-    ->set_tick_callback( [this]( buff_t*, int, timespan_t ) {
-      if ( talent.brambles->ok() )
-        active.brambles_pulse->execute();
-      } );
+    ->set_tick_behavior( buff_tick_behavior::NONE )
+    ->apply_affecting_aura( find_rank_spell( "Barkskin", "Rank 2" ) );
+  if ( talent.brambles->ok() )
+  {
+    buff.barkskin->set_tick_behavior( buff_tick_behavior::REFRESH )
+      ->set_tick_callback( [ this ]( buff_t*, int, timespan_t ) { active.brambles_pulse->execute(); } );
+  }
+  if ( legendary.the_natural_orders_will->ok() )
+  {
+    buff.barkskin->apply_affecting_aura( legendary.the_natural_orders_will )
+      ->set_stack_change_callback( [ this ]( buff_t*, int, int ) { active.the_natural_orders_will->execute(); } );
+  }
 
   buff.bristling_fur = make_buff( this, "bristling_fur", talent.bristling_fur )
     ->set_cooldown( 0_ms );
@@ -8649,6 +8699,9 @@ void druid_t::create_actions()
     instant_absorb_list.insert( std::make_pair<unsigned, instant_absorb_t>(
         talent.brambles->id(), instant_absorb_t( this, talent.brambles, "brambles", &brambles_handler ) ) );
   }
+
+  if ( legendary.the_natural_orders_will->ok() )
+    active.the_natural_orders_will = new the_natural_orders_will_t( this );
 
   if ( talent.galactic_guardian->ok() )
     active.galactic_guardian = new galactic_guardian_t( this );
@@ -9177,6 +9230,9 @@ void druid_t::arise()
 {
   player_t::arise();
 
+  if ( specialization() == DRUID_BALANCE || talent.balance_affinity->ok() )
+    eclipse_handler.enabled_ = true;
+
   if ( talent.earthwarden->ok() )
     buff.earthwarden->trigger( buff.earthwarden->max_stack() );
 
@@ -9201,8 +9257,9 @@ void druid_t::combat_begin()
 
   if ( legendary.lycaras_fleeting_glimpse->ok() )
   {
-    make_event<lycaras_fleeting_glimpse_event_t>(
-        *sim, this, timespan_t::from_seconds( legendary.lycaras_fleeting_glimpse->effectN( 1 ).base_value() ) );
+    make_event( *sim, timespan_t::from_seconds( buff.lycaras_fleeting_glimpse->default_value ), [ this ]() {
+      buff.lycaras_fleeting_glimpse->trigger();
+    } );
   }
 }
 

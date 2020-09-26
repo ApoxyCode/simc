@@ -3,6 +3,7 @@
 // Send questions to natehieter@gmail.com
 // ==========================================================================
 
+#include "action/sc_action_state.hpp"
 #include "sc_enums.hpp"
 #include "sc_priest.hpp"
 
@@ -106,16 +107,16 @@ public:
            td->dots.devouring_plague->is_ticking();
   }
 
-  double composite_da_multiplier( const action_state_t* state ) const override
+  double composite_target_da_multiplier( player_t* t ) const override
   {
-    double d = priest_spell_t::composite_da_multiplier( state );
+    double tdm = action_t::composite_target_da_multiplier( t );
 
-    if ( talbadars_stratagem_active( state->target ) )
+    if ( talbadars_stratagem_active( t ) )
     {
-      d *= 1 + priest().legendary.talbadars_stratagem->effectN( 1 ).percent();
+      tdm *= 1 + priest().legendary.talbadars_stratagem->effectN( 1 ).percent();
     }
 
-    return d;
+    return tdm;
   }
 
   void impact( action_state_t* s ) override
@@ -330,7 +331,7 @@ struct mind_flay_t final : public priest_spell_t
     priest_spell_t::execute();
 
     // Dissonant Echoes can proc on tick or on initial execute
-    // since it doesnt have a tick_zero we put it in both places
+    // since it doesn't have a tick_zero we put it in both places
     trigger_mind_flay_dissonant_echoes();
   }
 
@@ -386,8 +387,13 @@ struct painbreaker_psalm_t final : public priest_spell_t
 
 struct shadow_word_death_t final : public priest_spell_t
 {
+  double execute_percent;
+  double execute_modifier;
+
   shadow_word_death_t( priest_t& p, util::string_view options_str )
-    : priest_spell_t( "shadow_word_death", p, p.find_class_spell( "Shadow Word: Death" ) )
+    : priest_spell_t( "shadow_word_death", p, p.find_class_spell( "Shadow Word: Death" ) ),
+      execute_percent( data().effectN( 2 ).base_value() ),
+      execute_modifier( data().effectN( 3 ).percent() )
   {
     parse_options( options_str );
 
@@ -414,6 +420,23 @@ struct shadow_word_death_t final : public priest_spell_t
       energize_resource = RESOURCE_INSANITY;
       energize_amount   = 10;
     }
+  }
+
+  double composite_target_da_multiplier( player_t* t ) const override
+  {
+    double tdm = action_t::composite_target_da_multiplier( t );
+
+    if ( t->health_percentage() < execute_percent )
+    {
+      if ( sim->debug )
+      {
+        sim->print_debug( "{} below {}% HP. Increasing {} damage by {}", t->name_str, execute_percent, *this,
+                          execute_modifier );
+      }
+      tdm *= 1 + execute_modifier;
+    }
+
+    return tdm;
   }
 
   void impact( action_state_t* s ) override
@@ -885,6 +908,43 @@ struct vampiric_touch_t final : public priest_spell_t
 // ==========================================================================
 // Devouring Plague
 // ==========================================================================
+
+struct devouring_plague_dot_state_t : public action_state_t
+{
+  double rolling_multiplier;
+
+  devouring_plague_dot_state_t( action_t* a, player_t* t ) : action_state_t( a, t ), rolling_multiplier( 1.0 )
+  {
+  }
+
+  std::ostringstream& debug_str( std::ostringstream& s ) override
+  {
+    action_state_t::debug_str( s );
+    fmt::print( s, " rolling_multiplier={}", rolling_multiplier );
+    return s;
+  }
+
+  void initialize() override
+  {
+    action_state_t::initialize();
+    rolling_multiplier = 1.0;
+  }
+
+  void copy_state( const action_state_t* o ) override
+  {
+    action_state_t::copy_state( o );
+    auto other_dp_state = debug_cast<const devouring_plague_dot_state_t*>( o );
+    rolling_multiplier  = other_dp_state->rolling_multiplier;
+  }
+
+  double composite_ta_multiplier() const override
+  {
+    // Use the rolling multiplier to get the stored rolling damage of the previous DP (if it exists)
+    // This will dynamically adjust as the actor gains/loses intellect
+    return action_state_t::composite_ta_multiplier() * rolling_multiplier;
+  }
+};
+
 struct devouring_plague_t final : public priest_spell_t
 {
   bool casted;
@@ -894,8 +954,6 @@ struct devouring_plague_t final : public priest_spell_t
   {
     casted                     = _casted;
     may_crit                   = true;
-    tick_zero                  = false;
-    tick_may_crit              = true;
     affected_by_shadow_weaving = true;
   }
 
@@ -904,11 +962,20 @@ struct devouring_plague_t final : public priest_spell_t
     parse_options( options_str );
   }
 
+  action_state_t* new_state()
+  {
+    return new devouring_plague_dot_state_t( this, target );
+  }
+
+  devouring_plague_dot_state_t* cast_state( action_state_t* s )
+  {
+    return debug_cast<devouring_plague_dot_state_t*>( s );
+  }
+
   void consume_resource() override
   {
     priest_spell_t::consume_resource();
 
-    // TODO: Verify if Damnation can proc this
     if ( priest().buffs.mind_devourer->up() )
     {
       priest().buffs.mind_devourer->decrement();
@@ -934,6 +1001,62 @@ struct devouring_plague_t final : public priest_spell_t
     {
       priest().trigger_shadowy_apparitions( s );
     }
+  }
+
+  timespan_t calculate_dot_refresh_duration( const dot_t* d, timespan_t duration ) const override
+  {
+    // when you refresh, you lose the partial tick
+    if ( priest().bugs )
+    {
+      return duration + tick_time( d->state ) - ( d->time_to_tick - d->time_to_next_tick() );
+    }
+    else
+    {
+      return duration + d->time_to_next_tick();
+    }
+  }
+
+  void snapshot_state( action_state_t* s, result_amount_type rt ) override
+  {
+    priest_spell_t::snapshot_state( s, rt );
+
+    double multiplier = 1.0;
+    dot_t* dot        = get_dot( s->target );
+
+    // Calculate how much damage is left in the remaining Devouring Plague
+    // Convert that into a ratio so we can apply a modifier to every new tick of Devouring Plague
+    if ( dot->is_ticking() )
+    {
+      action_state_t* old_s = dot->state;
+      action_state_t* new_s = s;
+
+      timespan_t time_to_tick = dot->time_to_next_tick();
+      timespan_t old_remains  = dot->remains();
+      timespan_t new_remains  = calculate_dot_refresh_duration( dot, composite_dot_duration( new_s ) );
+      timespan_t old_tick     = tick_time( old_s );
+      timespan_t new_tick     = tick_time( new_s );
+      double old_multiplier   = cast_state( old_s )->rolling_multiplier;
+
+      // figure out how many old ticks to roll over
+      int num_full_ticks = as<int>( std::floor( ( old_remains - time_to_tick ) / old_tick ) );
+
+      // find number of ticks in new DP
+      double new_num_ticks = new_remains / new_tick;
+
+      sim->print_debug( "{} {} calculations - num_full_ticks: {}, new_num_ticks: {}", *player, *this, num_full_ticks,
+                        new_num_ticks );
+
+      // figure out the increase for each new tick of DP
+      double total_coefficient     = num_full_ticks * old_multiplier;
+      double increase_per_new_tick = total_coefficient / new_num_ticks;
+
+      multiplier = 1 + increase_per_new_tick;
+
+      sim->print_debug( "{} {} modifier updated per tick from previous dot. Modifier per tick went from {} to {}.",
+                        *player, *this, old_multiplier, multiplier );
+    }
+
+    cast_state( s )->rolling_multiplier = multiplier;
   }
 };
 
@@ -1005,6 +1128,11 @@ struct void_bolt_t final : public priest_spell_t
     if ( rank2->ok() )
     {
       void_bolt_extension = new void_bolt_extension_t( player, rank2 );
+    }
+
+    if ( priest().conduits.dissonant_echoes->ok() )
+    {
+      base_dd_multiplier *= ( 1.0 + priest().conduits.dissonant_echoes->effectN( 2 ).percent() );
     }
   }
 
@@ -1211,10 +1339,12 @@ struct psychic_horror_t final : public priest_spell_t
 struct void_torrent_t final : public priest_spell_t
 {
   double insanity_gain;
+  propagate_const<devouring_plague_t*> child_dp;
 
   void_torrent_t( priest_t& p, util::string_view options_str )
     : priest_spell_t( "void_torrent", p, p.talents.void_torrent ),
-      insanity_gain( p.talents.void_torrent->effectN( 3 ).trigger()->effectN( 1 ).resource( RESOURCE_INSANITY ) )
+      insanity_gain( p.talents.void_torrent->effectN( 3 ).trigger()->effectN( 1 ).resource( RESOURCE_INSANITY ) ),
+      child_dp( new devouring_plague_t( priest(), false ) )
   {
     parse_options( options_str );
 
@@ -1229,6 +1359,8 @@ struct void_torrent_t final : public priest_spell_t
     energize_type     = action_energize::PER_TICK;
     energize_resource = RESOURCE_INSANITY;
     energize_amount   = insanity_gain;
+
+    child_dp->background = true;
   }
 
   timespan_t composite_dot_duration( const action_state_t* ) const override
@@ -1259,6 +1391,11 @@ struct void_torrent_t final : public priest_spell_t
     priest_spell_t::execute();
 
     priest().buffs.void_torrent->trigger();
+
+    // TODO: Verify if this triggers just the DoT, or the upfront damage as well
+    // Void Torrent just applies Devouring Plague, it does not refresh it per tick
+    child_dp->set_target( target );
+    child_dp->execute();
   }
 
   void impact( action_state_t* s ) override
@@ -1269,7 +1406,6 @@ struct void_torrent_t final : public priest_spell_t
 
     td.dots.shadow_word_pain->refresh_duration();
     td.dots.vampiric_touch->refresh_duration();
-    td.dots.devouring_plague->refresh_duration();
   }
 };
 
@@ -1308,23 +1444,23 @@ struct shadow_crash_damage_t final : public priest_spell_t
     affected_by_shadow_weaving = true;
   }
 
-  double composite_da_multiplier( const action_state_t* state ) const override
+  double composite_target_da_multiplier( player_t* t ) const override
   {
-    double d = priest_spell_t::composite_da_multiplier( state );
+    double tdm = action_t::composite_target_da_multiplier( t );
 
-    const priest_td_t* td = find_td( state->target );
+    const priest_td_t* td = find_td( t );
 
     if ( td && td->buffs.shadow_crash_debuff->check() )
     {
       int stack             = td->buffs.shadow_crash_debuff->check();
       double increase       = priest().talents.shadow_crash->effectN( 1 ).trigger()->effectN( 2 ).percent();
       double stack_increase = increase * stack;
-      player->sim->print_debug( "{} target has {} stacks of the shadow_crash_debuff. Increasing Damage by {}", *target,
-                                stack, stack_increase );
-      d *= 1 + stack_increase;
+      player->sim->print_debug( "{} target has {} stacks of the shadow_crash_debuff. Increasing Damage by {}",
+                                t->name_str, stack, stack_increase );
+      tdm *= 1 + stack_increase;
     }
 
-    return d;
+    return tdm;
   }
 };
 
@@ -1414,18 +1550,18 @@ struct searing_nightmare_t final : public priest_spell_t
     return false;
   }
 
-  double composite_da_multiplier( const action_state_t* state ) const override
+  double composite_target_da_multiplier( player_t* t ) const override
   {
-    double d = priest_spell_t::composite_da_multiplier( state );
+    double tdm = action_t::composite_target_da_multiplier( t );
 
-    const priest_td_t* td = find_td( state->target );
+    const priest_td_t* td = find_td( t );
 
     if ( td && td->dots.shadow_word_pain->is_ticking() )
     {
-      d *= data().effectN( 1 ).percent();
+      tdm *= data().effectN( 1 ).percent();
     }
 
-    return d;
+    return tdm;
   }
 
   void impact( action_state_t* s ) override

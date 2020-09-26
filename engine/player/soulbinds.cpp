@@ -13,6 +13,8 @@
 #include "sim/sc_sim.hpp"
 #include "sim/sc_cooldown.hpp"
 
+#include <regex>
+
 namespace covenant
 {
 namespace soulbinds
@@ -127,6 +129,19 @@ void add_covenant_cast_callback( player_t* p, S&&... args )
   cb->cb_list.push_back( cb_entry );
 }
 
+double get_coefficient_from_desc_vars( special_effect_t& e, bool sp = true )
+{
+  double coef = 0;
+  if ( const char* vars = e.player->dbc->spell_desc_vars( e.spell_id ).desc_vars() )
+  {
+    std::cmatch m;
+    std::regex r( sp ? "\\$SP\\*([0-9]*\\.?[0-9]*)" : "\\$AP\\*([0-9]*\\.?[0-9]*)" );
+    if ( std::regex_search( vars, m, r ) && m.size() >= 2 )
+      coef = std::stod( m.str( 1 ) );
+  }
+  return coef;
+}
+
 struct niyas_tools_proc_t : public unique_gear::proc_spell_t
 {
   niyas_tools_proc_t( util::string_view n, player_t* p, const spell_data_t* s, double mod, bool direct = true ) : proc_spell_t( n, p, s )
@@ -147,7 +162,7 @@ void niyas_tools_burrs( special_effect_t& effect )
 {
   auto action = effect.player->find_action( "spiked_burrs" );
   if ( !action )
-    action = new niyas_tools_proc_t( "spiked_burrs", effect.player, effect.player->find_spell( 333526 ), 0.36, false );
+    action = new niyas_tools_proc_t( "spiked_burrs", effect.player, effect.player->find_spell( 333526 ), get_coefficient_from_desc_vars( effect ), false );
 
   effect.execute_action = action;
 
@@ -165,11 +180,11 @@ void niyas_tools_poison( special_effect_t& effect )
     {
       dot = e.player->find_action( "paralytic_poison" );
       if ( !dot )
-        dot = new niyas_tools_proc_t( "paralytic_poison", e.player, e.player->find_spell( 321519 ), 0.16, false );
+        dot = new niyas_tools_proc_t( "paralytic_poison", e.player, e.player->find_spell( 321519 ), get_coefficient_from_desc_vars( e ), false );
 
       direct = e.player->find_action( "paralytic_poison_interrupt" );
       if ( !direct )
-        direct = new niyas_tools_proc_t( "paralytic_poison_interrupt", e.player, e.player->find_spell( 321524 ), 0.16 );
+        direct = new niyas_tools_proc_t( "paralytic_poison_interrupt", e.player, e.player->find_spell( 321524 ), get_coefficient_from_desc_vars( e ) );
     }
 
     void execute( action_t* a, action_state_t* s ) override
@@ -341,13 +356,14 @@ void dauntless_duelist( special_effect_t& effect )
   {
     dauntless_duelist_cb_t( const special_effect_t& e ) : dbc_proc_callback_t( e.player, e ) {}
 
-    void execute( action_t* a, action_state_t* st ) override
+    void execute( action_t* a, action_state_t* s ) override
     {
-      auto td = a->player->get_target_data( st->target );
+      dbc_proc_callback_t::execute( a, s );
+
+      auto td = a->player->get_target_data( s->target );
       td->debuff.adversary->trigger();
 
       deactivate();
-      st->target->callbacks_on_demise.emplace_back( [this]( player_t* ) { activate(); } );
     }
 
     void reset() override
@@ -358,7 +374,22 @@ void dauntless_duelist( special_effect_t& effect )
     }
   };
 
-  new dauntless_duelist_cb_t( effect );
+  auto cb = new dauntless_duelist_cb_t( effect );
+  auto p  = effect.player;
+
+  range::for_each( p->sim->actor_list, [ p, cb ]( player_t* t ) {
+    if ( !t->is_enemy() )
+      return;
+
+    t->callbacks_on_demise.emplace_back( [ p, cb ]( player_t* t ) {
+      if ( p->sim->event_mgr.canceled )
+        return;
+
+      auto td = p->get_target_data( t );
+      if ( td->debuff.adversary->check() )
+        cb->activate();
+    } );
+  } );
 }
 
 void thrill_seeker( special_effect_t& effect )
@@ -400,38 +431,43 @@ void wasteland_propriety( special_effect_t& effect )
 {
   if ( !effect.player->buffs.wasteland_propriety )
   {
-    double duration_mod;
-    bool icd_enabled;
+    double duration_mod = 1.0;
+    bool icd_enabled = false;
 
     // The duration modifier for each class comes from the description variables of Wasteland Propriety (id=319983)
-    switch ( effect.player->type )
+    if ( const char* vars = effect.player->dbc->spell_desc_vars( effect.spell_id ).desc_vars() )
     {
-      case DEATH_KNIGHT: duration_mod = 1.0; break;
-      case DEMON_HUNTER: duration_mod = 1.0; break;
-      case DRUID: duration_mod = 3.0; break;
-      case HUNTER: duration_mod = 0.5; break;
-      case MAGE: duration_mod = 1.5; break;
-      case MONK: duration_mod = 3.0; break;
-      case PALADIN: duration_mod = 4.0; break;
-      case PRIEST: duration_mod = 0.8; break;
-      case ROGUE: duration_mod = 1.0; break;
-      case SHAMAN: duration_mod = 1.5; break;
-      case WARLOCK: duration_mod = 1.0; break;
-      case WARRIOR: duration_mod = 1.0; break;
-      default: duration_mod = 1.0; break;
+      // The description variables string contains instances of "?a137005[${1.0}]", where the class is
+      // defined by the class aura spell ID and the floating point number represents the duration modifier.
+      std::regex r( "\\?a(\\d+)\\[\\$\\{(\\d*\\.?\\d+)" );
+      std::cregex_iterator begin( vars, vars + std::strlen( vars ), r );
+      for( std::cregex_iterator i = begin; i != std::cregex_iterator(); i++ )
+      {
+        auto spell = effect.player->find_spell( std::stoi( ( *i ).str( 1 ) ) );
+        if ( spell->is_class( effect.player->type ) )
+        {
+          duration_mod = std::stod( ( *i ).str( 2 ) );
+          break;
+        }
+      }
     }
 
     // The ICD of 60 seconds is enabled for some classes in the description of Wasteland Propriety (id=319983)
-    switch ( effect.player->type )
+    if ( const char* desc = effect.player->dbc->spell_text( effect.spell_id ).desc() )
     {
-      case ROGUE:
-      case WARRIOR:
-        icd_enabled = true;
-        break;
-      default:
-        icd_enabled = false;
-        break;
+      // The relevant part of the description is formatted as a '|' delimited list of the
+      // letter 'a' followed by class aura spell IDs until we reach a '[' and a new line.
+      std::regex r( "(?=(?:a\\d+\\|?)*\\[[\r\n])a(\\d+)" );
+      std::cregex_iterator begin( desc, desc + std::strlen( desc ), r );
+      for( std::cregex_iterator i = begin; i != std::cregex_iterator(); i++ )
+      {
+        auto spell = effect.player->find_spell( std::stoi( ( *i ).str( 1 ) ) );
+        if ( icd_enabled = spell->is_class( effect.player->type ) )
+          break;
+      }
     }
+
+    effect.player->sim->print_debug( "class-specific properties for wasteland_propriety: duration_mod={}, icd_enabled={}", duration_mod, icd_enabled );
 
     effect.player->buffs.wasteland_propriety =
         make_buff( effect.player, "wasteland_propriety", effect.player->find_spell( 333218 ) )
