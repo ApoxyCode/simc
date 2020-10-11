@@ -300,6 +300,7 @@ action_t::action_t( action_e ty, util::string_view token, player_t* p, const spe
     harmful( true ),
     proc(),
     is_interrupt( false ),
+    is_precombat(),
     initialized(),
     may_hit( true ),
     may_miss(),
@@ -940,7 +941,7 @@ double action_t::base_cost() const
  */
 double action_t::cost() const
 {
-  if ( !harmful && !player->in_combat )
+  if ( !harmful && is_precombat )
     return 0;
 
   resource_e cr = current_resource();
@@ -992,7 +993,7 @@ double action_t::cost_per_tick( resource_e r ) const
 
 timespan_t action_t::gcd() const
 {
-  if ( ( !harmful && !player->in_combat ) || trigger_gcd == timespan_t::zero() )
+  if ( trigger_gcd == timespan_t::zero() )
     return timespan_t::zero();
 
   timespan_t gcd_ = trigger_gcd;
@@ -1741,13 +1742,13 @@ void action_t::tick( dot_t* d )
 
     // Apply the last tick factor from the DoT to the base damage multipliers for partial ticks
     // 6/23/2018 -- Revert the previous logic of overwriting the da modifiers with ta modifiers
-    tick_state->da_multiplier *= d->get_last_tick_factor();
-    tick_state->ta_multiplier *= d->get_last_tick_factor();
+    tick_state->da_multiplier *= d->get_tick_factor();
+    tick_state->ta_multiplier *= d->get_tick_factor();
 
     tick_action->schedule_execute( tick_state );
 
     sim->print_log("{} {} ticks ({} of {}) {}",
-        *player, *this, d->current_tick, d->num_ticks, *d->target );
+        *player, *this, d->current_tick, d->num_ticks(), *d->target );
   }
   else
   {
@@ -1756,7 +1757,7 @@ void action_t::tick( dot_t* d )
     if ( tick_may_crit && rng().roll( d->state->composite_crit_chance() ) )
       d->state->result = RESULT_CRIT;
 
-    d->state->result_amount = calculate_tick_amount( d->state, d->get_last_tick_factor() * d->current_stack() );
+    d->state->result_amount = calculate_tick_amount( d->state, d->get_tick_factor() * d->current_stack() );
 
     assess_damage( amount_type( d->state, true ), d->state );
 
@@ -1764,13 +1765,13 @@ void action_t::tick( dot_t* d )
       d->state->debug();
   }
 
-  if ( energize_type_() == action_energize::PER_TICK && d->get_last_tick_factor() >= 1.0)
+  if ( energize_type_() == action_energize::PER_TICK && d->get_tick_factor() >= 1.0)
   {
     // Partial tick is not counted for resource gain
     gain_energize_resource( energize_resource_(), composite_energize_amount( d->state ), gain );
   }
 
-  stats->add_tick( d->time_to_tick, d->state->target );
+  stats->add_tick( d->time_to_tick(), d->state->target );
 
   player->trigger_ready();
 }
@@ -2040,6 +2041,9 @@ void action_t::update_ready( timespan_t cd_duration /* = timespan_t::min() */ )
 bool action_t::usable_moving() const
 {
   if ( player->buffs.norgannons_foresight_ready && player->buffs.norgannons_foresight_ready->check() )
+    return true;
+
+  if ( player->buffs.norgannons_sagacity && player->buffs.norgannons_sagacity->check() )
     return true;
 
   if ( execute_time() > timespan_t::zero() )
@@ -2585,6 +2589,9 @@ void action_t::init_finished()
             option.cancel_if_expr_str ) );
     }
   }
+
+  if ( action_list && action_list->name_str == "precombat" )
+    is_precombat = true;
 }
 
 void action_t::reset()
@@ -2602,6 +2609,8 @@ void action_t::reset()
   travel_events.clear();
   target = default_target;
   last_used = timespan_t::min();
+
+  target_cache.is_valid = false;
 
   if( player->nth_iteration() == 1 )
   {
@@ -2800,6 +2809,9 @@ std::unique_ptr<expr_t> action_t::create_expression( util::string_view name_str 
   if ( name_str == "cast_time" )
     return make_mem_fn_expr( name_str, *this, &action_t::execute_time );
 
+  if ( name_str == "ready" )
+    return make_mem_fn_expr( name_str, *this, &action_t::ready );
+
   if ( name_str == "usable" )
     return make_mem_fn_expr( name_str, *cooldown, &cooldown_t::is_ready );
 
@@ -2896,26 +2908,6 @@ std::unique_ptr<expr_t> action_t::create_expression( util::string_view name_str 
 
   if ( auto q = dot_t::create_expression( nullptr, this, this, name_str, true ) )
     return q;
-
-  if ( name_str == "miss_react" )
-  {
-    struct miss_react_expr_t : public action_expr_t
-    {
-      miss_react_expr_t( action_t& a ) : action_expr_t( "miss_react", a )
-      {
-      }
-      double evaluate() override
-      {
-        dot_t* dot = action.find_dot( action.target );
-        if ( dot && ( dot->miss_time < timespan_t::zero() || action.sim->current_time() >= ( dot->miss_time ) ) )
-          return true;
-        else
-          return false;
-      }
-    };
-    return std::make_unique<miss_react_expr_t>( *this );
-
-  }
 
   if ( name_str == "cooldown_react" )
   {
@@ -3832,12 +3824,12 @@ void action_t::impact( action_state_t* s )
 void action_t::trigger_dot( action_state_t* s )
 {
   timespan_t duration = composite_dot_duration( s );
-  if ( duration <= timespan_t::zero() && ( !tick_zero || !tick_on_application ) )
+  if ( duration <= timespan_t::zero() )
     return;
 
   // To simulate precasting HoTs, remove one tick worth of duration if precombat.
   // We also add a fake zero_tick in dot_t::check_tick_zero().
-  if ( !harmful && !player->in_combat && ( !tick_zero || !tick_on_application ) )
+  if ( !harmful && is_precombat && !tick_zero && !tick_on_application )
     duration -= tick_time( s );
 
   dot_t* dot = get_dot( s->target );
@@ -4330,6 +4322,12 @@ rng::rng_t& action_t::rng() const
  */
 void action_t::acquire_target( retarget_source /* event */, player_t* /* context */, player_t* candidate_target )
 {
+  // Reset target cache every time target acquisition occurs for AOE spells
+  if ( n_targets() != 0 )
+  {
+    target_cache.is_valid = false;
+  }
+
   // Don't change targets if they are not of the same generic type (both enemies, or both friendlies)
   if ( target && candidate_target && target->is_enemy() != candidate_target->is_enemy() )
   {
@@ -4358,7 +4356,6 @@ void action_t::acquire_target( retarget_source /* event */, player_t* /* context
                              target ? target->name() : "(none)", candidate_target->name() );
     }
     target                = candidate_target;
-    target_cache.is_valid = false;
   }
 }
 
@@ -4698,7 +4695,7 @@ void action_t::apply_affecting_effect( const spelleffect_data_t& effect )
   if ( !effect.ok() || effect.type() != E_APPLY_AURA )
     return;
 
-  if ( !data().affected_by_all( *player->dbc, effect ) )
+  if ( !data().affected_by_all( effect ) )
   {
     return;
   }
@@ -4920,7 +4917,7 @@ void action_t::apply_affecting_effect( const spelleffect_data_t& effect )
     }
   }
   // Category-based Auras
-  else if ( data().category() == as<unsigned>( effect.misc_value1() ) )
+  else if ( data().affected_by_category( effect ) )
   {
     switch ( effect.subtype() )
     {

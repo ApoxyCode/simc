@@ -233,7 +233,7 @@ public:
   timespan_t last_expire_time() const { return last_expire; }
   bool   remains_gt( timespan_t time ) const;
   bool   remains_lt( timespan_t time ) const;
-  bool   at_max_stacks( int mod = 0 ) const { return check() + mod == max_stack(); }
+  bool   at_max_stacks( int mod = 0 ) const { return check() + mod >= max_stack(); }
   bool   trigger  ( action_t*, int stacks = 1, double value = DEFAULT_VALUE(), timespan_t duration = timespan_t::min() );
   bool   trigger  ( timespan_t duration );
   bool   trigger  ( int stacks, timespan_t duration );
@@ -312,6 +312,9 @@ public:
   //virtual buff_t* set_chance( double chance );
   buff_t* set_quiet( bool quiet );
   buff_t* add_invalidate( cache_e );
+  // Treat the buff's value as stat % increase and apply it automatically
+  // in the relevant player_t functions.
+  buff_t* set_pct_buff_type( stat_pct_buff_type );
   buff_t* set_default_value( double, size_t = 0 );
   virtual buff_t* set_default_value_from_effect( size_t, double = 0.0 );
   virtual buff_t* set_default_value_from_effect_type( effect_subtype_t a_type,
