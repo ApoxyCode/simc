@@ -1288,6 +1288,8 @@ class SpellDataGenerator(DataGenerator):
             ( 339669, 0 ),          # Seal of Command
             ( 339376, 0 ),          # Truth's Wake
             ( 339538, 0 ),          # TV echo
+            ( 327510, 0 ),          # Shining Light free WoG
+            ( 182104, 0 ),          # Shining Light stacks 1-4
         ),
 
         # Hunter:
@@ -1476,6 +1478,7 @@ class SpellDataGenerator(DataGenerator):
           ( 273466, 0 ),                                # Strength of Earth
           ( 279556, 0 ),                                # Rumbling Tremors damage spell
           ( 286976, 0 ),                                # Tectonic Thunder Azerite Trait buff
+          ( 327164, 0 ),                                # Primordial Wave buff
         ),
 
         # Mage:
@@ -1591,7 +1594,7 @@ class SpellDataGenerator(DataGenerator):
           ( 266087, 3 ),    # Rain of Chaos Buff
           ( 339784, 2 ),    # Tyrant's Soul Buff
           ( 337142, 2 ),    # Grim Inquisitor's Dread Calling Buff
-          ( 342997, 2 )     # Grim Inquisitor's Dread Calling Buff 2     
+          ( 342997, 2 )     # Grim Inquisitor's Dread Calling Buff 2
         ),
 
         # Monk:

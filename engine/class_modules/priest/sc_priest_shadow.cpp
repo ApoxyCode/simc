@@ -349,7 +349,6 @@ struct mind_flay_t final : public priest_spell_t
 
     if ( rng().roll( priest().conduits.dissonant_echoes.percent() ) )
     {
-      priest().cooldowns.void_bolt->reset( true );
       priest().buffs.dissonant_echoes->trigger();
       priest().procs.dissonant_echoes->occur();
     }
@@ -361,15 +360,6 @@ struct mind_flay_t final : public priest_spell_t
 
     priest().trigger_eternal_call_to_the_void( d->state );
     trigger_dark_thoughts( d->target, priest().procs.dark_thoughts_flay, d->state );
-    trigger_mind_flay_dissonant_echoes();
-  }
-
-  void execute() override
-  {
-    priest_spell_t::execute();
-
-    // Dissonant Echoes can proc on tick or on initial execute
-    // since it doesn't have a tick_zero we put it in both places
     trigger_mind_flay_dissonant_echoes();
   }
 
@@ -592,17 +582,17 @@ struct silence_t final : public priest_spell_t
     }
   }
 
-  void execute() override
+  void impact( action_state_t* state ) override
   {
-    priest_spell_t::execute();
+    priest_spell_t::impact( state );
 
-    // Only interrupts, does not keep target silenced. This works in most cases since bosses are rarely able to be
-    // completely silenced.
-    // Removed to not break Casting Patchwerk - 2017-09-22
-    // if ( target->debuffs.casting )
-    //{
-    // target->debuffs.casting->expire();
-    //}
+    if ( target->type == ENEMY_ADD || target->level() < sim->max_player_level + 3 )
+    {
+      if ( priest().legendary.sephuzs_proclamation->ok() && priest().buffs.sephuzs_proclamation )
+      {
+        priest().buffs.sephuzs_proclamation->trigger();
+      }
+    }
   }
 
   bool target_ready( player_t* candidate_target ) override
@@ -611,6 +601,9 @@ struct silence_t final : public priest_spell_t
       return false;
 
     if ( candidate_target->debuffs.casting && candidate_target->debuffs.casting->check() )
+      return true;
+
+    if ( target->type == ENEMY_ADD || target->level() < sim->max_player_level + 3 )
       return true;
 
     // Check if the target can get blank silenced
@@ -1726,7 +1719,8 @@ struct voidform_t final : public priest_buff_t<buff_t>
     if ( priest().azerite.chorus_of_insanity.enabled() )
     {
       priest().buffs.chorus_of_insanity->expire();
-      priest().buffs.chorus_of_insanity->trigger( expiration_stacks );
+      // This is fixed in-game right now
+      priest().buffs.chorus_of_insanity->trigger( 20 );
     }
 
     base_t::expire_override( expiration_stacks, remaining_duration );
@@ -1847,6 +1841,7 @@ struct chorus_of_insanity_t final : public priest_buff_t<stat_buff_t>
     add_stat( STAT_CRIT_RATING, p.azerite.chorus_of_insanity.value( 1 ) );
     set_reverse( true );
     set_tick_behavior( buff_tick_behavior::REFRESH );
+    set_max_stack( 20 );
   }
 };
 
@@ -2172,7 +2167,7 @@ void priest_t::generate_apl_shadow()
       "variable,name=pi_or_vf_sync_condition,op=set,value=(priest.self_power_infusion|runeforge.twins_of_the_sun_"
       "priestess.equipped)&level>=58&cooldown.power_infusion.up|(level<58|!priest.self_power_infusion&!runeforge.twins_"
       "of_the_sun_priestess.equipped)&cooldown.void_eruption.up",
-      "Variable to switch between syncing cooldown usage to Power Infusion or Void Eruption depenending whether "
+      "Variable to switch between syncing cooldown usage to Power Infusion or Void Eruption depending whether "
       "priest_self_power_infusion is in use or we don't have power infusion learned." );
 
   // Racials
@@ -2216,6 +2211,9 @@ void priest_t::generate_apl_shadow()
 
   // CDs
   cds->add_action( this, "Power Infusion", "if=buff.voidform.up" );
+  cds->add_action( this, "Silence",
+                   "target_if=runeforge.sephuzs_proclamation.equipped&(target.is_add|target.debuff.casting.react)",
+                   "Use Silence on CD to proc Sephuz's Proclamation." );
   cds->add_action( this, covenant.fae_guardians, "Fae Guardians" );
   cds->add_action( this, covenant.mindgames, "Mindgames",
                    "target_if=insanity<90&(variable.all_dots_up|buff.voidform.up)" );
@@ -2269,12 +2267,15 @@ void priest_t::generate_apl_shadow()
                     "Use VB on CD if you don't need to cast Devouring Plague, and there are less than 4 targets out (5 "
                     "with conduit)." );
   main->add_action( this, "Shadow Word: Death",
-                    "target_if=target.health.pct<20|(pet.fiend.active&runeforge.shadowflame_prism.equipped)",
+                    "target_if=(target.health.pct<20&spell_targets.mind_sear<4)|(pet.fiend.active&runeforge."
+                    "shadowflame_prism.equipped)",
                     "Use Shadow Word: Death if the target is about to die or you have Shadowflame Prism equipped with "
                     "Mindbender or Shadowfiend active." );
   main->add_talent( this, "Surrender to Madness", "target_if=target.time_to_die<25&buff.voidform.down",
                     "Use Surrender to Madness on a target that is going to die at the right time." );
-  main->add_talent( this, "Mindbender", "if=variable.dots_up" );
+  main->add_talent( this, "Mindbender",
+                    "if=dot.vampiric_touch.ticking&((talent.searing_nightmare.enabled&spell_targets.mind_sear>("
+                    "variable.mind_sear_cutoff+1))|dot.shadow_word_pain.ticking)" );
   main->add_talent( this, "Void Torrent",
                     "target_if=variable.dots_up&target.time_to_die>4&buff.voidform.down&spell_targets.mind_sear<(5+(6*"
                     "talent.twist_of_fate.enabled))",
@@ -2324,7 +2325,8 @@ void priest_t::generate_apl_shadow()
                     "target_if=spell_targets.mind_sear>variable.mind_sear_cutoff,chain=1,interrupt_immediate=1,"
                     "interrupt_if=ticks>=2" );
   main->add_action( this, "Mind Flay", "chain=1,interrupt_immediate=1,interrupt_if=ticks>=2&cooldown.void_bolt.up" );
-  main->add_action( this, "Shadow Word: Pain" );
+  main->add_action( this, "Shadow Word: Death", "", "Use SW:D as last resort if on the move" );
+  main->add_action( this, "Shadow Word: Pain", "", "Use SW:P as last resort if on the move and SW:D is on CD" );
 }
 
 void priest_t::init_background_actions_shadow()
